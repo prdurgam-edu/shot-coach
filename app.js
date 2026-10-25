@@ -27,6 +27,14 @@ const BURST_GAP_MS = 120;
 const SPEAK_GAP_MS = 3200; // minimum time between two prompts
 const REPEAT_MS = 9000; // the same prompt is repeated at most this often
 const AFTER_SHOT_MS = 8000; // pause auto-capture after a photo
+// Cloud detection: one answer comes back roughly every 1.5 seconds, so it needs fewer repeats.
+const CLOUD_INTERVAL_MS = 1100; // minimum time between pictures sent
+const CLOUD_TIMEOUT_MS = 9000;
+const CLOUD_PERSIST = 2;
+const CLOUD_HOLD = 2;
+const CLOUD_STEADY_MS = 1000; // camera must be still this long before a shot
+const MOTION_LIMIT = 5; // smoothed brightness change between small snapshots that counts as moving
+const STALE_LIMIT = 10; // an answer is ignored if the view changed this much while it was in flight
 
 const READY = { en: 'Camera ready.', hi: 'कैमरा तैयार है।', te: 'కెమెరా సిద్ధంగా ఉంది.' };
 const WHO = {
@@ -43,15 +51,15 @@ const els = {
   flash: $('flash'), status: $('status'), shutter: $('shutter'), thumb: $('thumb'), flip: $('flip'),
   voiceBtn: $('voiceBtn'), autoBtn: $('autoBtn'), settingsBtn: $('settingsBtn'),
   setup: $('setup'), startBtn: $('startBtn'), setupError: $('setupError'), voiceNote: $('voiceNote'),
-  askSmile: $('askSmile'), gallery: $('gallery'), grid: $('grid'), closeGallery: $('closeGallery'),
+  askSmile: $('askSmile'), cloudBox: $('cloudBox'), cloudUrl: $('cloudUrl'), cloudKey: $('cloudKey'), gallery: $('gallery'), grid: $('grid'), closeGallery: $('closeGallery'),
 };
 
 const state = {
   lang: 'en', subjects: 'group', framing: 'upper', askSmile: true, voice: true, auto: true,
-  facing: 'environment', running: false,
+  facing: 'environment', running: false, engine: 'cloud', cloudUrl: '', cloudKey: '',
 };
 const STORE_KEY = 'shotcoach.v1';
-const SAVED = ['lang', 'subjects', 'framing', 'askSmile', 'voice', 'auto'];
+const SAVED = ['lang', 'subjects', 'framing', 'askSmile', 'voice', 'auto', 'engine', 'cloudUrl', 'cloudKey'];
 
 function loadSettings() {
   try {
@@ -67,11 +75,14 @@ function saveSettings() {
 
 function radio(name) { return document.querySelector(`input[name="${name}"]:checked`)?.value; }
 function applyToForm() {
-  for (const name of ['lang', 'subjects', 'framing']) {
+  for (const name of ['lang', 'subjects', 'framing', 'engine']) {
     const el = document.querySelector(`input[name="${name}"][value="${state[name]}"]`);
     if (el) el.checked = true;
   }
   els.askSmile.checked = state.askSmile;
+  els.cloudUrl.value = state.cloudUrl;
+  els.cloudKey.value = state.cloudKey;
+  els.cloudBox.hidden = state.engine !== 'cloud';
   refreshButtons();
 }
 function readForm() {
@@ -79,6 +90,9 @@ function readForm() {
   state.subjects = radio('subjects') || state.subjects;
   state.framing = radio('framing') || state.framing;
   state.askSmile = els.askSmile.checked;
+  state.engine = radio('engine') || state.engine;
+  state.cloudUrl = els.cloudUrl.value.trim().replace(/\/+$/, '');
+  state.cloudKey = els.cloudKey.value.trim();
   saveSettings();
 }
 function refreshButtons() {
@@ -87,12 +101,12 @@ function refreshButtons() {
   if (!state.auto) els.hold.hidden = true;
 }
 // Tap the status line to see technical details (useful when something does not work on a phone).
-const diag = { frames: 0, count: 0, ms: 0, err: '', show: false };
+const diag = { frames: 0, count: 0, ms: 0, motion: 0, err: '', show: false };
 let statusText = '';
 function renderStatus() {
   if (!diag.show) { els.status.textContent = statusText; return; }
   const v = els.video;
-  els.status.textContent = `${statusText} | ${engine.face || '-'} ${diag.ms}ms | video ${v.videoWidth}x${v.videoHeight} | frames ${diag.frames} | faces ${diag.count}${diag.err ? ' | ' + diag.err : ''}`;
+  els.status.textContent = `${statusText} | ${state.engine === 'cloud' ? 'cloud' : engine.face || '-'} ${diag.ms}ms | video ${v.videoWidth}x${v.videoHeight} | frames ${diag.frames} | faces ${diag.count} | motion ${diag.motion}${diag.err ? ' | ' + diag.err : ''}`;
 }
 function setStatus(t) { statusText = t; renderStatus(); }
 els.status.addEventListener('click', () => { diag.show = !diag.show; els.status.style.whiteSpace = diag.show ? 'normal' : 'nowrap'; renderStatus(); });
@@ -352,6 +366,7 @@ function resetCoach() {
 }
 
 function isSteady() {
+  if (state.engine === 'cloud') return performance.now() - lastMovedAt > CLOUD_STEADY_MS;
   if (history.length < 8) return false;
   const xs = history.map((h) => h.cx), ws = history.map((h) => h.width);
   return Math.max(...xs) - Math.min(...xs) < 0.02 && Math.max(...ws) - Math.min(...ws) < 0.03;
@@ -373,17 +388,24 @@ function onTick(now) {
   } catch (e) { console.error(e); diag.err = String(e && e.message ? e.message : e); return; }
 
   const frame = toFrame(faceRes, poseRes);
-  lastFrame = frame;
-  diag.frames++;
-  diag.count = frame.faces.length;
   diag.ms = Math.round(performance.now() - ts);
   zeroTicks = frame.faces.length ? 0 : zeroTicks + 1;
   if (zeroTicks >= 60 && engine.face === 'GPU' && !switching) switchFaceToCPU(); // about 6 seconds with nobody found
+  process(frame, now);
+}
+
+// Shared by both engines: judge a frame, update the banner and voice, and decide when to shoot.
+function process(frame, now) {
+  const persistTicks = state.engine === 'cloud' ? CLOUD_PERSIST : PERSIST_TICKS;
+  const holdTicks = state.engine === 'cloud' ? CLOUD_HOLD : HOLD_TICKS;
+  lastFrame = frame;
+  diag.frames++;
+  diag.count = frame.faces.length;
   const { issues, stats } = analyze(frame, { subjects: state.subjects, framing: state.framing, askSmile: state.askSmile });
 
   const present = new Set(issues);
   for (const k of ISSUE_ORDER) counts[k] = present.has(k) ? (counts[k] || 0) + 1 : 0;
-  const stable = ISSUE_ORDER.filter((k) => counts[k] >= PERSIST_TICKS);
+  const stable = ISSUE_ORDER.filter((k) => counts[k] >= persistTicks);
   const top = stable[0] || null;
 
   const blocked = issues.some((k) => BLOCKING.has(k));
@@ -401,7 +423,7 @@ function onTick(now) {
     const repeat = top !== lastKey || now - lastKeyAt > REPEAT_MS;
     const quiet = now - lastSpokenAt > SPEAK_GAP_MS && !(window.speechSynthesis && speechSynthesis.speaking);
     if (repeat && quiet) { speak(text[top]); lastKey = top; lastKeyAt = now; }
-  } else if (readyStreak >= 3) {
+  } else if (readyStreak >= (state.engine === 'cloud' ? 1 : 3)) {
     showBanner('good', who.you, text.hold);
     if (!holdSpoken && state.auto) { holdSpoken = true; speak(text.hold); }
   } else if (stats.count) {
@@ -412,15 +434,137 @@ function onTick(now) {
 
   const holding = state.auto && readyStreak > 0 && !capturing;
   els.hold.hidden = !holding;
-  if (holding) els.hold.firstElementChild.style.width = `${Math.min(100, (readyStreak / HOLD_TICKS) * 100)}%`;
+  if (holding) els.hold.firstElementChild.style.width = `${Math.min(100, (readyStreak / holdTicks) * 100)}%`;
 
-  if (state.auto && !capturing && readyStreak >= HOLD_TICKS && isSteady() && now - lastShotAt > AFTER_SHOT_MS) {
+  if (state.auto && !capturing && readyStreak >= holdTicks && isSteady() && now - lastShotAt > AFTER_SHOT_MS) {
     capture(BURST_FRAMES);
+  }
+}
+
+// ---------------------------------------------------------------- cloud detection
+
+const mCanvas = document.createElement('canvas');
+mCanvas.width = 32; mCanvas.height = 18;
+const mCtx = mCanvas.getContext('2d', { willReadFrequently: true });
+let curThumb = null;
+let lastMovedAt = 0;
+let lastMotionAt = 0;
+let motionAvg = 0;
+function sampleThumb() {
+  mCtx.drawImage(els.video, 0, 0, 32, 18);
+  const d = mCtx.getImageData(0, 0, 32, 18).data;
+  const g = new Uint8Array(32 * 18);
+  for (let i = 0, j = 0; i < d.length; i += 4, j++) g[j] = (d[i] + d[i + 1] + d[i + 2]) / 3;
+  return g;
+}
+function thumbDiff(a, b) {
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]);
+  return s / a.length;
+}
+function updateMotion(now) {
+  if (now - lastMotionAt < 100) return;
+  lastMotionAt = now;
+  const t = sampleThumb();
+  if (curThumb) {
+    // Smooth over a few snapshots so one flicker does not count as movement, but a real pan does.
+    motionAvg = 0.7 * motionAvg + 0.3 * thumbDiff(curThumb, t);
+    diag.motion = Math.round(motionAvg * 10) / 10;
+    if (motionAvg > MOTION_LIMIT) lastMovedAt = now;
+  }
+  curThumb = t;
+}
+
+const probeJpeg = document.createElement('canvas');
+function frameToJpeg() {
+  const w = 640, h = Math.max(1, Math.round((w * els.video.videoHeight) / els.video.videoWidth));
+  probeJpeg.width = w; probeJpeg.height = h;
+  probeJpeg.getContext('2d').drawImage(els.video, 0, 0, w, h);
+  return new Promise((r) => probeJpeg.toBlob(r, 'image/jpeg', 0.7));
+}
+function cloudHeaders(extra = {}) { return { 'X-Api-Key': state.cloudKey, ...extra }; }
+function withTimeout(ms) {
+  if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) return AbortSignal.timeout(ms);
+  const c = new AbortController(); setTimeout(() => c.abort(), ms); return c.signal;
+}
+async function checkServer() {
+  if (!/^https:\/\//i.test(state.cloudUrl) || !state.cloudKey) throw Object.assign(new Error('need server'), { name: 'NeedServer' });
+  let r;
+  try { r = await fetch(`${state.cloudUrl}/check`, { headers: cloudHeaders(), signal: withTimeout(CLOUD_TIMEOUT_MS) }); }
+  catch { throw Object.assign(new Error('server down'), { name: 'ServerDown' }); }
+  if (r.status === 401) throw Object.assign(new Error('bad code'), { name: 'BadCode' });
+  if (!r.ok) throw Object.assign(new Error('server ' + r.status), { name: 'ServerDown' });
+}
+
+function cloudToFrame(data) {
+  const mirror = state.facing === 'user';
+  const faces = (data.faces || []).map((f) => {
+    let { minX, maxX, minY, maxY } = f;
+    if (mirror) [minX, maxX] = [1 - maxX, 1 - minX];
+    const h = maxY - minY;
+    return {
+      minX, maxX, maxY,
+      minY: Math.max(0, minY - 0.2 * h), // leave room for hair
+      box: { minX, maxX, minY, maxY },
+      blink: f.eyesClosed ? 1 : 0,
+      smile: f.smiling ? 0.8 : 0,
+    };
+  });
+  return { faces, bodies: (data.people || []).map((p) => ({ feetVisible: p.feetVisible })) };
+}
+
+let cloudBusy = false;
+let lastSent = 0;
+let cloudFails = 0;
+async function cloudStep(now) {
+  updateMotion(now);
+  if (cloudBusy || capturing || now - lastSent < CLOUD_INTERVAL_MS || !curThumb) return;
+  cloudBusy = true;
+  lastSent = now;
+  const sentThumb = curThumb;
+  const t0 = performance.now();
+  try {
+    const blob = await frameToJpeg();
+    const r = await fetch(`${state.cloudUrl}/analyze`, {
+      method: 'POST', body: blob, signal: withTimeout(CLOUD_TIMEOUT_MS),
+      headers: cloudHeaders({ 'Content-Type': 'image/jpeg', 'X-Framing': state.framing }),
+    });
+    if (r.status === 401) throw Object.assign(new Error('bad code'), { name: 'BadCode' });
+    if (!r.ok) throw new Error('Server ' + r.status);
+    const data = await r.json();
+    cloudFails = 0;
+    diag.err = '';
+    diag.ms = Math.round(performance.now() - t0);
+    if (!state.running) return;
+    if (thumbDiff(sentThumb, curThumb) > STALE_LIMIT) {
+      // The phone moved while the picture was being analysed, so the answer no longer matches the view.
+      readyStreak = 0;
+      draw([], true);
+      setStatus('Hold the phone steady');
+      return;
+    }
+    process(cloudToFrame(data), performance.now());
+  } catch (e) {
+    cloudFails++;
+    diag.err = String(e && e.message ? e.message : e);
+    if (cloudFails >= 2) {
+      const msg = e && e.name === 'BadCode' ? 'The access code was not accepted. Check it in Settings.' : "Can't reach the server. Check your internet connection.";
+      showBanner('issue', 'Server', msg);
+      readyStreak = 0;
+      setStatus('Server problem');
+    }
+  } finally {
+    cloudBusy = false;
   }
 }
 
 function loop(now) {
   rafId = requestAnimationFrame(loop);
+  if (state.engine === 'cloud') {
+    if (!state.running || document.hidden || els.video.readyState < 2) return;
+    cloudStep(now);
+    return;
+  }
   if (!state.running || document.hidden || !faceLM || switching) return;
   if (now - lastTick < TICK_MS) return;
   if (els.video.readyState < 2 || els.video.currentTime === lastVideoTime) return;
@@ -531,11 +675,19 @@ function openGallery() {
 
 function explain(e) {
   const name = e && e.name;
+  if (name === 'NeedServer') return 'Enter your server address (it starts with https://) and the access code, or choose "On this phone".';
+  if (name === 'ServerDown') return "Can't reach the server. Check the address and your internet connection.";
+  if (name === 'BadCode') return 'The server did not accept that access code.';
   if (name === 'InsecureContext') return 'The camera only works on a secure (https) address. Open this app from its https link, not from a file on the phone.';
   if (name === 'NotAllowedError' || name === 'SecurityError') return "Camera access was blocked. Allow the camera for this site in the browser's site settings, then tap Start camera again.";
   if (name === 'NotFoundError' || name === 'OverconstrainedError') return 'No camera was found on this device.';
   if (name === 'NotReadableError') return 'Another app is using the camera. Close it and try again.';
   return 'Could not start. ' + (e && e.message ? e.message : 'Check your internet connection and try again.');
+}
+
+async function prepareEngine() {
+  if (state.engine === 'cloud') { setStatus('Checking the server'); await checkServer(); }
+  else await ensureDetectors();
 }
 
 let started = false;
@@ -548,14 +700,14 @@ async function onStart() {
     if (!started) {
       els.startBtn.textContent = 'Starting…';
       await startCamera();
-      await ensureDetectors();
+      await prepareEngine();
       started = true;
       state.running = true;
       els.shutter.disabled = false;
       keepAwake();
       layoutCanvas();
     } else {
-      await ensureDetectors(); // loads the body model when Full length was just chosen
+      await prepareEngine(); // loads the body model when Full length was just chosen, or checks the server
     }
     resetCoach();
     els.setup.hidden = true;
@@ -574,7 +726,10 @@ async function onStart() {
 
 els.startBtn.addEventListener('click', onStart);
 els.settingsBtn.addEventListener('click', () => { applyToForm(); updateVoiceNote(); els.setup.hidden = false; });
-els.setup.addEventListener('change', (e) => { if (e.target.name === 'lang') updateVoiceNote(); });
+els.setup.addEventListener('change', (e) => {
+  if (e.target.name === 'lang') updateVoiceNote();
+  if (e.target.name === 'engine') els.cloudBox.hidden = e.target.value !== 'cloud';
+});
 els.voiceBtn.addEventListener('click', () => {
   state.voice = !state.voice;
   if (!state.voice && window.speechSynthesis) speechSynthesis.cancel();

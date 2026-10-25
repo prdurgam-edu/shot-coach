@@ -104,6 +104,9 @@
   .check { display: flex; gap: 12px; align-items: flex-start; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
   .check input { width: 22px; height: 22px; accent-color: var(--marigold); margin: 1px 0 0; flex: none; }
   .check small { display: block; color: var(--muted); }
+  .fields { display: flex; flex-direction: column; gap: 12px; margin-top: 4px; }
+  .field { display: flex; flex-direction: column; gap: 6px; font-size: 0.85rem; color: var(--muted); }
+  .field input { font: inherit; font-size: 1rem; color: var(--text); background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 12px; min-width: 0; }
   .primary { background: var(--marigold); color: var(--marigold-ink); border: 0; border-radius: 14px; padding: 16px 18px; font-weight: 800; font-size: 1.05rem; cursor: pointer; }
   .primary:disabled { opacity: 0.6; }
   .ghost { background: transparent; border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px; cursor: pointer; }
@@ -188,6 +191,19 @@
       <div class="seg">
         <label><input type="radio" name="framing" value="upper" checked><span>Faces and upper body</span></label>
         <label><input type="radio" name="framing" value="full"><span>Full length</span></label>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Where faces are found</legend>
+      <div class="seg">
+        <label><input type="radio" name="engine" value="cloud" checked><span>On my server</span></label>
+        <label><input type="radio" name="engine" value="local"><span>On this phone</span></label>
+      </div>
+      <div id="cloudBox" class="fields">
+        <label class="field">Server address<input id="cloudUrl" type="url" inputmode="url" placeholder="https://shot-coach-api-xxxx.a.run.app" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+        <label class="field">Access code<input id="cloudKey" type="password" autocomplete="off"></label>
+        <p class="note">About once a second, a small picture from the camera is sent to your server to find faces. Nothing is stored.</p>
       </div>
     </fieldset>
 
