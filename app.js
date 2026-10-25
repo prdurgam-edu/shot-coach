@@ -86,7 +86,16 @@ function refreshButtons() {
   els.autoBtn.setAttribute('aria-pressed', String(state.auto));
   if (!state.auto) els.hold.hidden = true;
 }
-function setStatus(t) { els.status.textContent = t; }
+// Tap the status line to see technical details (useful when something does not work on a phone).
+const diag = { frames: 0, count: 0, ms: 0, err: '', show: false };
+let statusText = '';
+function renderStatus() {
+  if (!diag.show) { els.status.textContent = statusText; return; }
+  const v = els.video;
+  els.status.textContent = `${statusText} | ${engine.face || '-'} ${diag.ms}ms | video ${v.videoWidth}x${v.videoHeight} | frames ${diag.frames} | faces ${diag.count}${diag.err ? ' | ' + diag.err : ''}`;
+}
+function setStatus(t) { statusText = t; renderStatus(); }
+els.status.addEventListener('click', () => { diag.show = !diag.show; els.status.style.whiteSpace = diag.show ? 'normal' : 'nowrap'; renderStatus(); });
 function showError(msg) { els.setupError.textContent = msg; els.setupError.hidden = !msg; }
 
 // ---------------------------------------------------------------- voice
@@ -112,7 +121,7 @@ function updateVoiceNote() {
   const has = !!pickVoice(lang);
   els.voiceNote.classList.toggle('warn', !has);
   els.voiceNote.textContent = has
-    ? `A ${label} voice is available on this phone.`
+    ? `${label} voice is available on this phone.`
     : `No ${label} voice found on this phone yet. Prompts will show on screen. You can add a voice in the phone's text-to-speech settings.`;
 }
 let lastSpokenAt = 0;
@@ -185,12 +194,16 @@ async function pickModel(m) {
   } catch { /* not bundled */ }
   return m.remote;
 }
-async function createLandmarker(Cls, model, extra) {
+const engine = { face: '', pose: '' }; // which delegate (GPU or CPU) each model is running on
+const FACE_OPTIONS = { numFaces: 8, outputFaceBlendshapes: true, minFaceDetectionConfidence: 0.4, minFacePresenceConfidence: 0.4 };
+async function createLandmarker(Cls, model, extra, key, delegates = ['GPU', 'CPU']) {
   const modelAssetPath = await pickModel(model);
   let last;
-  for (const delegate of ['GPU', 'CPU']) {
+  for (const delegate of delegates) {
     try {
-      return await Cls.createFromOptions(fileset, { baseOptions: { modelAssetPath, delegate }, runningMode: 'VIDEO', ...extra });
+      const lm = await Cls.createFromOptions(fileset, { baseOptions: { modelAssetPath, delegate }, runningMode: 'VIDEO', ...extra });
+      engine[key] = delegate;
+      return lm;
     } catch (e) { last = e; }
   }
   throw last;
@@ -200,11 +213,31 @@ async function ensureDetectors() {
   if (!fileset) fileset = await v.FilesetResolver.forVisionTasks(wasmBase);
   if (!faceLM) {
     setStatus('Loading face model');
-    faceLM = await createLandmarker(v.FaceLandmarker, MODELS.face, { numFaces: 8, outputFaceBlendshapes: true });
+    faceLM = await createLandmarker(v.FaceLandmarker, MODELS.face, FACE_OPTIONS, 'face');
   }
   if (state.framing === 'full' && !poseLM) {
     setStatus('Loading body model');
-    poseLM = await createLandmarker(v.PoseLandmarker, MODELS.pose, { numPoses: 8 });
+    poseLM = await createLandmarker(v.PoseLandmarker, MODELS.pose, { numPoses: 8 }, 'pose');
+  }
+}
+
+// Some phones run the GPU engine but return no faces. If nobody has been found for a while
+// on GPU, switch the face model to the CPU engine once.
+let zeroTicks = 0;
+let switching = false;
+async function switchFaceToCPU() {
+  switching = true;
+  setStatus('Switching detection engine');
+  try {
+    faceLM.close?.();
+    faceLM = null;
+    faceLM = await createLandmarker(vision.FaceLandmarker, MODELS.face, FACE_OPTIONS, 'face', ['CPU']);
+  } catch (e) {
+    console.error(e);
+    diag.err = String(e && e.message ? e.message : e);
+  } finally {
+    switching = false;
+    zeroTicks = 0;
   }
 }
 
@@ -337,10 +370,15 @@ function onTick(now) {
   try {
     faceRes = faceLM.detectForVideo(els.video, ts);
     if (state.framing === 'full' && poseLM) poseRes = poseLM.detectForVideo(els.video, ts + 0.01);
-  } catch (e) { console.error(e); return; }
+  } catch (e) { console.error(e); diag.err = String(e && e.message ? e.message : e); return; }
 
   const frame = toFrame(faceRes, poseRes);
   lastFrame = frame;
+  diag.frames++;
+  diag.count = frame.faces.length;
+  diag.ms = Math.round(performance.now() - ts);
+  zeroTicks = frame.faces.length ? 0 : zeroTicks + 1;
+  if (zeroTicks >= 60 && engine.face === 'GPU' && !switching) switchFaceToCPU(); // about 6 seconds with nobody found
   const { issues, stats } = analyze(frame, { subjects: state.subjects, framing: state.framing, askSmile: state.askSmile });
 
   const present = new Set(issues);
@@ -383,7 +421,7 @@ function onTick(now) {
 
 function loop(now) {
   rafId = requestAnimationFrame(loop);
-  if (!state.running || document.hidden || !faceLM) return;
+  if (!state.running || document.hidden || !faceLM || switching) return;
   if (now - lastTick < TICK_MS) return;
   if (els.video.readyState < 2 || els.video.currentTime === lastVideoTime) return;
   lastTick = now;
