@@ -14,6 +14,10 @@ The app is a static site. GitHub Pages serves it at https://prdurgam-edu.github.
 
 ## 2. Deploy the server (once)
 
+Easiest: open Google Cloud Shell with this repo at https://shell.cloud.google.com/?cloudshell_git_repo=https%3A%2F%2Fgithub.com%2Fprdurgam-edu%2Fshot-coach&cloudshell_workspace=.&show=terminal and run `bash server/deploy.sh`. It asks for your project (if none is selected), your Gemini key and an access code, then prints the server address.
+
+Or do the same by hand:
+
 You need a Google Cloud project with billing turned on, and the Google Cloud CLI (`gcloud`). Run these in PowerShell from this folder.
 
 First get a Gemini API key at https://aistudio.google.com/apikey, and choose any access code you like (a long random string). The app sends the code with every picture so strangers cannot use your server.
